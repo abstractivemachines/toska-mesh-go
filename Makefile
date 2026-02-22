@@ -1,5 +1,5 @@
 MODULE   := github.com/toska-mesh/toska-mesh-go
-PROTO_DIR := ../proto
+PROTO_DIR := ../toska-mesh-proto
 PB_DIR   := pkg/meshpb
 
 export PATH := $(HOME)/go/bin:$(PATH)

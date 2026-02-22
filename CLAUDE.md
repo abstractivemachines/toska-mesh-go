@@ -18,7 +18,7 @@ The control plane itself lives in `../toska-mesh/`. This is just the Go SDK for 
 ```bash
 make test       # go test -race ./...
 make build      # build example binaries → bin/
-make generate   # regenerate Go protobuf from ../proto/
+make generate   # regenerate Go protobuf from ../toska-mesh-proto/
 make lint       # golangci-lint (skipped if not installed)
 make clean      # remove bin/
 
@@ -70,7 +70,7 @@ Same as `../toska-mesh/CLAUDE.md`: standard Go style, errors as values, context 
 
 ## Protobuf
 
-Generated from `../proto/discovery.proto`. Run `make generate` after modifying the proto.
+Generated from `../toska-mesh-proto/discovery.proto`. Run `make generate` after modifying the proto.
 
 ## Environment Variables
 
