@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"time"
 )
 
@@ -84,7 +85,11 @@ type ServiceOptions struct {
 	Routing      RoutingOptions             // Routing configuration.
 	HealthChecks map[string]HealthChecker   // Named health checks run by the /health endpoint.
 	Logger       *slog.Logger               // Custom logger. nil = default JSON logger.
+	Middleware   []Middleware               // HTTP middleware applied in order (first = outermost).
 }
+
+// Middleware wraps an http.Handler, returning a new handler.
+type Middleware func(http.Handler) http.Handler
 
 // Option is a functional option for configuring a MeshService.
 type Option func(*ServiceOptions)
@@ -185,4 +190,10 @@ func WithLogger(l *slog.Logger) Option {
 // will run. The worst status across all checks determines the overall status.
 func WithHealthCheck(name string, checker HealthChecker) Option {
 	return func(o *ServiceOptions) { o.HealthChecks[name] = checker }
+}
+
+// WithMiddleware appends HTTP middleware. Middleware runs in order: the first
+// added is the outermost wrapper (sees every request first).
+func WithMiddleware(mw ...Middleware) Option {
+	return func(o *ServiceOptions) { o.Middleware = append(o.Middleware, mw...) }
 }

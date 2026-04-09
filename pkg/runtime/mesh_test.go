@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -372,6 +374,184 @@ func TestRetryWithBackoff_AllFail(t *testing.T) {
 	if attempts != 3 {
 		t.Fatalf("expected 3 attempts, got %d", attempts)
 	}
+}
+
+func TestMiddleware_ExecutionOrder(t *testing.T) {
+	var order []string
+
+	mw1 := Middleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			order = append(order, "mw1-before")
+			next.ServeHTTP(w, r)
+			order = append(order, "mw1-after")
+		})
+	})
+	mw2 := Middleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			order = append(order, "mw2-before")
+			next.ServeHTTP(w, r)
+			order = append(order, "mw2-after")
+		})
+	})
+
+	svc, err := New(
+		WithServiceName("mw-order"),
+		WithPort(0),
+		WithAutoRegister(false),
+		WithHeartbeat(false),
+		WithMiddleware(mw1, mw2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.HandleFunc("GET /test", func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, "handler")
+		w.Write([]byte("ok"))
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	var addr string
+	for range 50 {
+		addr = svc.Addr()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("service did not bind")
+	}
+
+	resp, err := http.Get("http://" + addr + "/test")
+	if err != nil {
+		t.Fatalf("GET /test: %v", err)
+	}
+	resp.Body.Close()
+
+	expected := []string{"mw1-before", "mw2-before", "handler", "mw2-after", "mw1-after"}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %v, got %v", expected, order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("order[%d] = %q, want %q", i, order[i], v)
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+func TestMiddleware_Use(t *testing.T) {
+	var called atomic.Bool
+
+	svc, err := New(
+		WithServiceName("mw-use"),
+		WithPort(0),
+		WithAutoRegister(false),
+		WithHeartbeat(false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called.Store(true)
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	svc.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("pong"))
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	var addr string
+	for range 50 {
+		addr = svc.Addr()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("service did not bind")
+	}
+
+	resp, err := http.Get("http://" + addr + "/ping")
+	if err != nil {
+		t.Fatalf("GET /ping: %v", err)
+	}
+	resp.Body.Close()
+
+	if !called.Load() {
+		t.Fatal("expected Use() middleware to be called")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestRecovery_CatchesPanic(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	svc, err := New(
+		WithServiceName("recovery-test"),
+		WithPort(0),
+		WithAutoRegister(false),
+		WithHeartbeat(false),
+		WithMiddleware(Recovery(logger)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc.HandleFunc("GET /boom", func(w http.ResponseWriter, r *http.Request) {
+		panic("test panic")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	var addr string
+	for range 50 {
+		addr = svc.Addr()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("service did not bind")
+	}
+
+	resp, err := http.Get("http://" + addr + "/boom")
+	if err != nil {
+		t.Fatalf("GET /boom: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	}
+
+	cancel()
+	<-done
 }
 
 func TestBuildMetadata(t *testing.T) {

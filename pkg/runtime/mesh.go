@@ -37,9 +37,10 @@ import (
 // MeshService is a mesh-aware HTTP service that auto-registers with Discovery,
 // sends heartbeats, and deregisters on shutdown.
 type MeshService struct {
-	opts   ServiceOptions
-	mux    *http.ServeMux
-	logger *slog.Logger
+	opts       ServiceOptions
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	middleware []Middleware
 
 	healthChecks map[string]HealthChecker
 
@@ -87,11 +88,15 @@ func New(opts ...Option) (*MeshService, error) {
 
 	mux := http.NewServeMux()
 
+	mw := make([]Middleware, len(o.Middleware))
+	copy(mw, o.Middleware)
+
 	return &MeshService{
 		opts:         o,
 		mux:          mux,
 		logger:       logger,
 		healthChecks: checks,
+		middleware:   mw,
 	}, nil
 }
 
@@ -109,6 +114,12 @@ func (s *MeshService) HandleFunc(pattern string, handler http.HandlerFunc) {
 // AddHealthCheck registers a named health check. Must be called before Start/Run.
 func (s *MeshService) AddHealthCheck(name string, checker HealthChecker) {
 	s.healthChecks[name] = checker
+}
+
+// Use appends HTTP middleware. Must be called before Start/Run.
+// Middleware runs in order: the first added is the outermost wrapper.
+func (s *MeshService) Use(mw ...Middleware) {
+	s.middleware = append(s.middleware, mw...)
 }
 
 // Addr returns the bound address after Start. Empty before Start.
@@ -206,8 +217,14 @@ func (s *MeshService) start(ctx context.Context) error {
 		close(heartbeatDone)
 	}
 
+	// Apply middleware chain (first added = outermost).
+	var handler http.Handler = s.mux
+	for i := len(s.middleware) - 1; i >= 0; i-- {
+		handler = s.middleware[i](handler)
+	}
+
 	// Start HTTP server.
-	server := &http.Server{Handler: s.mux}
+	server := &http.Server{Handler: handler}
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -453,6 +470,66 @@ func (s *MeshService) retryWithBackoff(ctx context.Context, name string, maxRetr
 		}
 	}
 	return lastErr
+}
+
+// RequestLogging returns middleware that logs each request with method, path,
+// status code, and duration using the provided logger.
+func RequestLogging(logger *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(sw, r)
+			logger.Info("request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.status,
+				"duration", time.Since(start).String(),
+			)
+		})
+	}
+}
+
+// Recovery returns middleware that recovers from panics in downstream handlers,
+// logs the panic, and returns a 500 response.
+func Recovery(logger *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if v := recover(); v != nil {
+					logger.Error("panic recovered",
+						"panic", v,
+						"method", r.Method,
+						"path", r.URL.Path,
+					)
+					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 func (s *MeshService) buildMetadata() map[string]string {
