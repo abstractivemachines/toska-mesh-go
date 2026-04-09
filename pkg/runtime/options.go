@@ -1,6 +1,10 @@
 package runtime
 
-import "time"
+import (
+	"context"
+	"log/slog"
+	"time"
+)
 
 // LoadBalancingStrategy controls how the router distributes traffic.
 type LoadBalancingStrategy string
@@ -12,6 +16,42 @@ const (
 	WeightedRoundRobin LoadBalancingStrategy = "WeightedRoundRobin"
 	IPHash             LoadBalancingStrategy = "IPHash"
 )
+
+// Default timeout and retry constants.
+const (
+	DefaultDeregisterTimeout = 5 * time.Second
+	DefaultShutdownTimeout   = 10 * time.Second
+	DefaultHeartbeatTimeout  = 5 * time.Second
+	DefaultMaxRetries        = 3
+	DefaultRetryBaseDelay    = 1 * time.Second
+	DefaultRetryMaxDelay     = 10 * time.Second
+	DefaultHeartbeatRetryDelay = 2 * time.Second
+)
+
+// HealthStatus represents the health of a check.
+type HealthStatus string
+
+const (
+	StatusHealthy   HealthStatus = "Healthy"
+	StatusUnhealthy HealthStatus = "Unhealthy"
+	StatusDegraded  HealthStatus = "Degraded"
+)
+
+// HealthResult is the outcome of a single health check.
+type HealthResult struct {
+	Status HealthStatus
+	Output string
+}
+
+// HealthChecker runs a single named health check.
+type HealthChecker interface {
+	Check(ctx context.Context) HealthResult
+}
+
+// HealthCheckerFunc adapts a function to HealthChecker.
+type HealthCheckerFunc func(ctx context.Context) HealthResult
+
+func (f HealthCheckerFunc) Check(ctx context.Context) HealthResult { return f(ctx) }
 
 // RoutingOptions controls how this service is routed to by the mesh gateway.
 type RoutingOptions struct {
@@ -40,8 +80,10 @@ type ServiceOptions struct {
 
 	DiscoveryAddress string // gRPC address of discovery service. Default: "localhost:8080".
 
-	Metadata map[string]string // Custom metadata propagated to discovery.
-	Routing  RoutingOptions    // Routing configuration.
+	Metadata     map[string]string          // Custom metadata propagated to discovery.
+	Routing      RoutingOptions             // Routing configuration.
+	HealthChecks map[string]HealthChecker   // Named health checks run by the /health endpoint.
+	Logger       *slog.Logger               // Custom logger. nil = default JSON logger.
 }
 
 // Option is a functional option for configuring a MeshService.
@@ -61,6 +103,7 @@ func DefaultOptions() ServiceOptions {
 		AutoRegister:       true,
 		DiscoveryAddress:   "localhost:8080",
 		Metadata:           make(map[string]string),
+		HealthChecks:       make(map[string]HealthChecker),
 		Routing: RoutingOptions{
 			Scheme:   "http",
 			Strategy: RoundRobin,
@@ -123,4 +166,23 @@ func WithRoutingWeight(w int) Option {
 
 func WithRoutingScheme(scheme string) Option {
 	return func(o *ServiceOptions) { o.Routing.Scheme = scheme }
+}
+
+func WithHealthTimeout(d time.Duration) Option {
+	return func(o *ServiceOptions) { o.HealthTimeout = d }
+}
+
+func WithUnhealthyThreshold(n int) Option {
+	return func(o *ServiceOptions) { o.UnhealthyThreshold = n }
+}
+
+// WithLogger sets a custom slog.Logger. If nil, a default JSON logger is used.
+func WithLogger(l *slog.Logger) Option {
+	return func(o *ServiceOptions) { o.Logger = l }
+}
+
+// WithHealthCheck registers a named health check that the /health endpoint
+// will run. The worst status across all checks determines the overall status.
+func WithHealthCheck(name string, checker HealthChecker) Option {
+	return func(o *ServiceOptions) { o.HealthChecks[name] = checker }
 }

@@ -1,6 +1,9 @@
 package runtime
 
 import (
+	"context"
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 )
@@ -104,5 +107,48 @@ func TestFunctionalOptions(t *testing.T) {
 	}
 	if o.Routing.Scheme != "https" {
 		t.Fatalf("Scheme: got %q", o.Routing.Scheme)
+	}
+}
+
+func TestWithHealthTimeout(t *testing.T) {
+	o := DefaultOptions()
+	WithHealthTimeout(10 * time.Second)(&o)
+	if o.HealthTimeout != 10*time.Second {
+		t.Fatalf("HealthTimeout: got %v", o.HealthTimeout)
+	}
+}
+
+func TestWithUnhealthyThreshold(t *testing.T) {
+	o := DefaultOptions()
+	WithUnhealthyThreshold(5)(&o)
+	if o.UnhealthyThreshold != 5 {
+		t.Fatalf("UnhealthyThreshold: got %d", o.UnhealthyThreshold)
+	}
+}
+
+func TestWithLogger(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	svc, err := New(WithServiceName("logger-test"), WithLogger(logger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.logger != logger {
+		t.Fatal("expected custom logger to be used")
+	}
+}
+
+func TestWithHealthCheck(t *testing.T) {
+	checker := HealthCheckerFunc(func(context.Context) HealthResult {
+		return HealthResult{Status: StatusHealthy, Output: "ok"}
+	})
+	svc, err := New(WithServiceName("hc-test"), WithHealthCheck("db", checker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := svc.healthChecks["db"]; !ok {
+		t.Fatal("expected 'db' health check to be registered")
+	}
+	if _, ok := svc.healthChecks["self"]; !ok {
+		t.Fatal("expected 'self' health check to always be present")
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -39,6 +40,8 @@ type MeshService struct {
 	opts   ServiceOptions
 	mux    *http.ServeMux
 	logger *slog.Logger
+
+	healthChecks map[string]HealthChecker
 
 	// Set after Start; used by tests.
 	boundAddr string
@@ -68,14 +71,27 @@ func New(opts ...Option) (*MeshService, error) {
 		o.Routing.HealthCheckEndpoint = o.HealthEndpoint
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := o.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+
+	// Copy health checks so callers can't mutate after construction.
+	checks := make(map[string]HealthChecker, len(o.HealthChecks)+1)
+	checks["self"] = HealthCheckerFunc(func(context.Context) HealthResult {
+		return HealthResult{Status: StatusHealthy, Output: "ok"}
+	})
+	for name, checker := range o.HealthChecks {
+		checks[name] = checker
+	}
 
 	mux := http.NewServeMux()
 
 	return &MeshService{
-		opts:   o,
-		mux:    mux,
-		logger: logger,
+		opts:         o,
+		mux:          mux,
+		logger:       logger,
+		healthChecks: checks,
 	}, nil
 }
 
@@ -88,6 +104,11 @@ func (s *MeshService) Handle(pattern string, handler http.Handler) {
 // HandleFunc registers an HTTP handler function on the service's mux.
 func (s *MeshService) HandleFunc(pattern string, handler http.HandlerFunc) {
 	s.mux.HandleFunc(pattern, handler)
+}
+
+// AddHealthCheck registers a named health check. Must be called before Start/Run.
+func (s *MeshService) AddHealthCheck(name string, checker HealthChecker) {
+	s.healthChecks[name] = checker
 }
 
 // Addr returns the bound address after Start. Empty before Start.
@@ -129,8 +150,16 @@ func (s *MeshService) start(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Resolve actual port if ephemeral.
-	_, portStr, _ := net.SplitHostPort(s.boundAddr)
-	actualPort, _ := strconv.Atoi(portStr)
+	_, portStr, err := net.SplitHostPort(s.boundAddr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("runtime: parse bound address %s: %w", s.boundAddr, err)
+	}
+	actualPort, err := strconv.Atoi(portStr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("runtime: parse port %q: %w", portStr, err)
+	}
 
 	s.logger.Info("service starting",
 		"service", s.opts.ServiceName,
@@ -147,16 +176,21 @@ func (s *MeshService) start(ctx context.Context) error {
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)
 		if err != nil {
-			ln.Close()
+			if closeErr := ln.Close(); closeErr != nil {
+				s.logger.Warn("close listener", "error", closeErr)
+			}
 			return fmt.Errorf("runtime: connect to discovery %s: %w", s.opts.DiscoveryAddress, err)
 		}
 		discoveryClient = pb.NewDiscoveryRegistryClient(grpcConn)
 	}
 
-	// Register with Discovery.
+	// Register with Discovery (with retry).
 	if s.opts.AutoRegister && discoveryClient != nil {
-		if regErr := s.register(ctx, discoveryClient, actualPort); regErr != nil {
-			s.logger.Error("registration failed", "error", regErr)
+		regErr := s.retryWithBackoff(ctx, "register", DefaultMaxRetries, func(ctx context.Context) error {
+			return s.register(ctx, discoveryClient, actualPort)
+		})
+		if regErr != nil {
+			s.logger.Error("registration failed after retries", "error", regErr)
 			// Continue running — service may work without registration.
 		}
 	}
@@ -196,13 +230,13 @@ func (s *MeshService) start(ctx context.Context) error {
 
 	// Deregister from Discovery.
 	if s.opts.AutoRegister && discoveryClient != nil {
-		deregCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		deregCtx, cancel := context.WithTimeout(context.Background(), DefaultDeregisterTimeout)
 		defer cancel()
 		s.deregister(deregCtx, discoveryClient)
 	}
 
 	// Graceful HTTP shutdown.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), DefaultShutdownTimeout)
 	defer cancel()
 	server.Shutdown(shutdownCtx)
 
@@ -274,37 +308,151 @@ func (s *MeshService) heartbeatLoop(ctx context.Context, client pb.DiscoveryRegi
 	ticker := time.NewTicker(s.opts.HealthInterval)
 	defer ticker.Stop()
 
+	var consecutiveFailures int
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sendHeartbeat(ctx, client)
+			if err := s.sendHeartbeatWithRetry(ctx, client); err != nil {
+				consecutiveFailures++
+				level := slog.LevelWarn
+				if consecutiveFailures >= 5 {
+					level = slog.LevelError
+				}
+				s.logger.Log(ctx, level, "heartbeat failed",
+					"error", err,
+					"consecutiveFailures", consecutiveFailures,
+					"serviceId", s.opts.ServiceID,
+				)
+			} else {
+				if consecutiveFailures > 0 {
+					s.logger.Info("heartbeat recovered",
+						"afterFailures", consecutiveFailures,
+						"serviceId", s.opts.ServiceID,
+					)
+				}
+				consecutiveFailures = 0
+			}
 		}
 	}
 }
 
-func (s *MeshService) sendHeartbeat(ctx context.Context, client pb.DiscoveryRegistryClient) {
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+func (s *MeshService) sendHeartbeatWithRetry(ctx context.Context, client pb.DiscoveryRegistryClient) error {
+	var lastErr error
+	for attempt := range DefaultMaxRetries {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(DefaultHeartbeatRetryDelay):
+			}
+		}
 
-	_, err := client.ReportHealth(reqCtx, &pb.ReportHealthRequest{
-		ServiceId: s.opts.ServiceID,
-		Status:    pb.HealthStatus_HEALTH_STATUS_HEALTHY,
-		Output:    "heartbeat",
-	})
-	if err != nil {
-		s.logger.Warn("heartbeat failed", "error", err, "serviceId", s.opts.ServiceID)
+		reqCtx, cancel := context.WithTimeout(ctx, DefaultHeartbeatTimeout)
+		_, err := client.ReportHealth(reqCtx, &pb.ReportHealthRequest{
+			ServiceId: s.opts.ServiceID,
+			Status:    pb.HealthStatus_HEALTH_STATUS_HEALTHY,
+			Output:    "heartbeat",
+		})
+		cancel()
+
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		s.logger.Warn("heartbeat attempt failed",
+			"attempt", attempt+1,
+			"maxAttempts", DefaultMaxRetries,
+			"error", err,
+		)
+	}
+	return lastErr
+}
+
+type checkResult struct {
+	Status   HealthStatus `json:"status"`
+	Output   string       `json:"output,omitempty"`
+	Duration string       `json:"duration"`
+}
+
+func (s *MeshService) healthHandler(w http.ResponseWriter, r *http.Request) {
+	overall := StatusHealthy
+	checks := make(map[string]checkResult, len(s.healthChecks))
+
+	for name, checker := range s.healthChecks {
+		start := time.Now()
+		checkCtx, cancel := context.WithTimeout(r.Context(), DefaultHeartbeatTimeout)
+		result := checker.Check(checkCtx)
+		cancel()
+
+		checks[name] = checkResult{
+			Status:   result.Status,
+			Output:   result.Output,
+			Duration: time.Since(start).String(),
+		}
+
+		// Worst status wins: Unhealthy > Degraded > Healthy.
+		if result.Status == StatusUnhealthy {
+			overall = StatusUnhealthy
+		} else if result.Status == StatusDegraded && overall != StatusUnhealthy {
+			overall = StatusDegraded
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if overall == StatusUnhealthy {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	resp := map[string]any{
+		"status":  overall,
+		"service": s.opts.ServiceName,
+		"id":      s.opts.ServiceID,
+		"checks":  checks,
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		s.logger.Warn("health response encode failed", "error", err)
 	}
 }
 
-func (s *MeshService) healthHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "Healthy",
-		"service": s.opts.ServiceName,
-		"id":      s.opts.ServiceID,
-	})
+// retryWithBackoff retries fn up to maxRetries times with exponential backoff
+// and jitter. Returns the last error if all attempts fail.
+func (s *MeshService) retryWithBackoff(ctx context.Context, name string, maxRetries int, fn func(ctx context.Context) error) error {
+	var lastErr error
+	delay := DefaultRetryBaseDelay
+
+	for attempt := range maxRetries {
+		if err := fn(ctx); err != nil {
+			lastErr = err
+			if attempt == maxRetries-1 {
+				break
+			}
+			// Add 0–50% jitter.
+			jitter := time.Duration(rand.Int64N(int64(delay) / 2))
+			wait := delay + jitter
+
+			s.logger.Warn("retrying "+name,
+				"attempt", attempt+1,
+				"maxRetries", maxRetries,
+				"backoff", wait,
+				"error", err,
+			)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+
+			// Exponential increase, capped.
+			delay = min(delay*2, DefaultRetryMaxDelay)
+		} else {
+			return nil
+		}
+	}
+	return lastErr
 }
 
 func (s *MeshService) buildMetadata() map[string]string {

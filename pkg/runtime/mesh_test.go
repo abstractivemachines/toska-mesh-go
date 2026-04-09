@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -88,15 +89,23 @@ func TestMeshService_HealthEndpoint(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var body map[string]string
+	var body struct {
+		Status  string                    `json:"status"`
+		Service string                    `json:"service"`
+		ID      string                    `json:"id"`
+		Checks  map[string]map[string]any `json:"checks"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["status"] != "Healthy" {
-		t.Fatalf("expected status=Healthy, got %q", body["status"])
+	if body.Status != "Healthy" {
+		t.Fatalf("expected status=Healthy, got %q", body.Status)
 	}
-	if body["service"] != "health-test" {
-		t.Fatalf("expected service=health-test, got %q", body["service"])
+	if body.Service != "health-test" {
+		t.Fatalf("expected service=health-test, got %q", body.Service)
+	}
+	if _, ok := body.Checks["self"]; !ok {
+		t.Fatal("expected 'self' check in response")
 	}
 
 	cancel()
@@ -195,6 +204,174 @@ func TestMeshService_EphemeralPort(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestHealthCheck_CustomChecks(t *testing.T) {
+	svc, err := New(
+		WithServiceName("custom-health"),
+		WithPort(0),
+		WithAutoRegister(false),
+		WithHeartbeat(false),
+		WithHealthCheck("db", HealthCheckerFunc(func(context.Context) HealthResult {
+			return HealthResult{Status: StatusHealthy, Output: "connected"}
+		})),
+		WithHealthCheck("cache", HealthCheckerFunc(func(context.Context) HealthResult {
+			return HealthResult{Status: StatusUnhealthy, Output: "connection refused"}
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	var addr string
+	for range 50 {
+		addr = svc.Addr()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("service did not bind")
+	}
+
+	resp, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for unhealthy check, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Status string                    `json:"status"`
+		Checks map[string]map[string]any `json:"checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Status != string(StatusUnhealthy) {
+		t.Fatalf("expected overall Unhealthy, got %q", body.Status)
+	}
+	if body.Checks["db"]["status"] != string(StatusHealthy) {
+		t.Fatalf("expected db=Healthy, got %v", body.Checks["db"]["status"])
+	}
+	if body.Checks["cache"]["status"] != string(StatusUnhealthy) {
+		t.Fatalf("expected cache=Unhealthy, got %v", body.Checks["cache"]["status"])
+	}
+	if _, ok := body.Checks["self"]; !ok {
+		t.Fatal("expected 'self' check to always be present")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestHealthCheck_DegradedReturns200(t *testing.T) {
+	svc, err := New(
+		WithServiceName("degraded-health"),
+		WithPort(0),
+		WithAutoRegister(false),
+		WithHeartbeat(false),
+		WithHealthCheck("slow-dep", HealthCheckerFunc(func(context.Context) HealthResult {
+			return HealthResult{Status: StatusDegraded, Output: "high latency"}
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx) }()
+
+	var addr string
+	for range 50 {
+		addr = svc.Addr()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("service did not bind")
+	}
+
+	resp, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Degraded still returns 200.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for degraded, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Status string `json:"status"`
+	}
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Status != string(StatusDegraded) {
+		t.Fatalf("expected Degraded, got %q", body.Status)
+	}
+
+	cancel()
+	<-done
+}
+
+func TestRetryWithBackoff(t *testing.T) {
+	svc, err := New(WithServiceName("retry-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail twice then succeed.
+	attempts := 0
+	retryErr := svc.retryWithBackoff(context.Background(), "test-op", 3, func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return fmt.Errorf("transient error %d", attempts)
+		}
+		return nil
+	})
+
+	if retryErr != nil {
+		t.Fatalf("expected success after retries, got %v", retryErr)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestRetryWithBackoff_AllFail(t *testing.T) {
+	svc, err := New(WithServiceName("retry-fail-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attempts := 0
+	retryErr := svc.retryWithBackoff(context.Background(), "test-op", 3, func(context.Context) error {
+		attempts++
+		return fmt.Errorf("permanent error")
+	})
+
+	if retryErr == nil {
+		t.Fatal("expected error after all retries exhausted")
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
 }
 
 func TestBuildMetadata(t *testing.T) {
